@@ -2,7 +2,7 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-I made this tool because the default dynamic ONNX quantization, while fast, often degrades the performance of finetuned models, especially those with subgraphs. Excluding a few nodes restores performance instantly without keeping everything in FP32, without sacrificing  inference speed. To do that, this script employs a two-stage workflow to identify the optimal set of nodes to exclude from quantization in ONNX encoder-decoder models.
+I made this tool because the default dynamic ONNX quantization, while fast, often degrades the performance of finetuned models, especially those with subgraphs. Excluding a few nodes restores performance instantly without keeping everything in FP32 and sacrificing  inference speed. To do that, this script employs a two-stage workflow to identify the optimal set of nodes to exclude from quantization in ONNX encoder-decoder models.
 
 ## Key Features
 
