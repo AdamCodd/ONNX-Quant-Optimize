@@ -1,0 +1,10 @@
+onnx==1.18.0
+onnxruntime-gpu==1.22.0
+numpy==2.3.2
+transformers==4.55.4
+evaluate==0.4.5
+jiwer==4.0.0
+safetensors==0.6.2
+sentencepiece==0.2.1
+optimum[onnxruntime]==1.27.0
+torch==2.8.0
