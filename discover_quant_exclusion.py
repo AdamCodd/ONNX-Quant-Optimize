@@ -212,7 +212,8 @@ if __name__ == "__main__":
     search_args = {
         "reference_score": REFERENCE_SCORE, "run_benchmark_args": run_benchmark_args, "cfg": cfg,
         "quant_type": quant_type, "quant_extra_options": quant_extra_options,
-        "minimize_metric": minimize_metric, "primary_metric": PRIMARY_METRIC
+        "minimize_metric": minimize_metric, "primary_metric": PRIMARY_METRIC,
+        "quant_test_dir": QUANT_TEST_DIR
     }
 
     # When search_target is 'both', we check the encoder first, then the decoder.
