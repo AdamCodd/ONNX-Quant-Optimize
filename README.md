@@ -61,11 +61,11 @@ or if you're testing on GPU:
 
 3.  **Run the script:**
     ```bash
-    python quant-optimizer.py --config config_quant.json
+    python discover_quant_exclusion.py --config config_quant.json
     ```
     Export the quantized ONNX encoder/decoder (optionally):
      ```bash
-    python quant-optimizer.py --config config_quant.json --export_final path/to/your/directory
+    python discover_quant_exclusion.py --config config_quant.json --export_final path/to/your/directory
     ```   
 
 ## Configuration
