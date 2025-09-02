@@ -2,7 +2,7 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-I made this tool because the default dynamic ONNX quantization, while fast, often degrades the performance of finetuned models, especially those with subgraphs. Excluding a few nodes restores performance instantly without keeping everything in FP32 and sacrificing  inference speed. To do that, this script employs a two-stage workflow to identify the optimal set of nodes to exclude from quantization in ONNX encoder-decoder models.
+I made this tool because the default dynamic ONNX quantization, while fast, often degrades the performance of finetuned models, especially those with subgraphs. Excluding a few nodes restores performance instantly without keeping everything in FP32 and sacrificing  inference speed. To do that, this script employs a two-stage workflow to identify the optimal set of nodes to exclude from quantization in ONNX encoder-decoder models. **Still WIP and supports only encoder-decoder models**.
 
 ## Key Features
 
@@ -20,6 +20,7 @@ The script automates the process of discovering which nodes in an ONNX model are
 2.  **Stage 1: Sensitive Operator Discovery**: The script iteratively excludes nodes by their operator type (e.g., `MatMul`, `Add`, `Gelu`) and measures the impact on a primary performance metric. This stage identifies a "tipping point" operator, where excluding it and all preceding operator types brings the model's performance to a desired level.
 3.  **Stage 2: Pruning**: Starting with the broad list of nodes from Stage 1, this stage systematically re-includes nodes one by one to find the smallest possible set of excluded nodes that maintains the performance gains.
 4.  **Final Evaluation**: The script provides a final benchmark of the partially quantized model and a detailed comparison against the baselines.
+Supports multiprocessing to speed up the process.
 
 ## Getting Started
 
@@ -112,3 +113,7 @@ FP32 Reference                          15.2345                  -     0.1234   
 QUInt8 Dynamic (Fully Quantized)        8.1234    -7.111s (x0.53)      0.1876      0.0789     +0.0642     +0.0333       240.12MB
 QUInt8 Dynamic (Partially Quantized)    8.5678    -6.667s (x0.56)      0.1255      0.0467     +0.0021     +0.0011       245.34MB
 ```
+
+## Current limitations
+* Only encoder-decoders models. It needs to be extended to encoder and decoder only models.
+* Needs a lot of space for the intermediate onnx files when there are many nodes to check.
