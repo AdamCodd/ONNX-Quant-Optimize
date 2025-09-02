@@ -1,7 +1,13 @@
+# quant_engine.py
+
 import logging
-import tempfile
 import os
 import time
+import sys
+import json
+import shutil
+import uuid
+import multiprocessing
 from tqdm import tqdm
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Optional
@@ -12,7 +18,7 @@ import numpy as np
 from transformers import AutoTokenizer, AutoConfig
 
 # Local imports
-from quant_utils import _extract_sample_fields, _load_state, _save_state_atomic, _remove_state, SuppressQuantFilter
+from quant_utils import SuppressQuantFilter, _extract_sample_fields, _load_state, _save_state_atomic, _remove_state, _cleanup_stage1_temp_dirs
 
 # Attach filter to ONNX Runtime and root logger to suppress those noisy warnings
 logging.getLogger('onnxruntime').addFilter(SuppressQuantFilter())
@@ -79,8 +85,7 @@ def map_present_to_past(decoder_inputs: List[Any], decoder_outputs: List[Any]) -
         candidates.append(oname.replace("present", "past_key_values").replace(".", "_"))
         # try simpler containing tokens
         base = oname
-        candidates.extend([c for c in [base, base + "_past", "past_" + base] if c])
-        # find first candidate that exists
+        candidates.extend([c for c in [base, base + "_past", "past_" + base] if c])        # find first candidate that exists
         for c in candidates:
             if c in input_names:
                 mapping[oname] = c
@@ -194,7 +199,6 @@ def run_benchmark(
         encoder_sess = ort.InferenceSession(str(encoder_path), providers=[execution_provider], sess_options=sess_opt)
         decoder_sess = ort.InferenceSession(str(decoder_path), providers=[execution_provider], sess_options=sess_opt)
         
-        # ==== STOP TIMER FOR MODEL LOADING AND PRINT ====
         load_end_time = time.perf_counter()
         loading_time = load_end_time - load_start_time
         logging.info(f"🕑 Model loading time: {loading_time:.4f} seconds")
@@ -215,7 +219,6 @@ def run_benchmark(
         attention_mask = inputs['attention_mask'].astype(np.int64)
         batch_size = input_ids.shape[0]
 
-        # ==== START TIMER FOR INFERENCE ====
         inference_start_time = time.perf_counter()
 
         # Encoder forward
@@ -261,7 +264,7 @@ def run_benchmark(
         use_cache_branch = np.array([False], dtype=bool)
         encoder_past_frozen = False
 
-        # We'll convert outputs to a map by name after running session
+        # Convert outputs to a map by name after running session
         for _ in range(max_generation_length):
             if not np.any(unfinished_sequences): break
 
@@ -312,14 +315,11 @@ def run_benchmark(
             use_cache_branch[0] = True
             if not encoder_past_frozen: encoder_past_frozen = True
         
-        # ==== STOP TIMER FOR INFERENCE ====
         inference_end_time = time.perf_counter()
         inference_time = inference_end_time - inference_start_time
 
-        # ---- BATCH DECODE AND SCORE CALCULATION ----
         predictions = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
 
-        # --- Print predictions and ground truths for inspection ---
         logging.info("Sample predictions vs. ground truths:")
         for i, (prediction, ground_truth) in enumerate(zip(predictions, ground_truths)):
             logging.info(f"Sample {i+1}:")
@@ -332,7 +332,6 @@ def run_benchmark(
             if 'accuracy' in scores: scores['accuracy'].append(1.0 if prediction.strip() == ground_truth.strip() else 0.0)
             if 'bleu' in scores and 'bleu' in metric_calculators:
                 scores['bleu'].append(metric_calculators['bleu'].compute(predictions=[prediction], references=[[ground_truth]])['bleu'])
-            # rouge handling
             if 'rouge' in metric_calculators and any(r in scores for r in ['rouge1', 'rouge2', 'rougeL', 'rougeLsum']):
                 rouge_results = metric_calculators['rouge'].compute(predictions=[prediction], references=[ground_truth])
                 if 'rouge1' in scores: scores['rouge1'].append(rouge_results.get('rouge1', 0.0))
@@ -359,6 +358,7 @@ def dynamic_quantization(
 ) -> None:
     q_args = {
         "weight_type": quant_type,
+        "per_channel": True,
         "nodes_to_exclude": nodes_to_exclude
     }
     if extra_options:
@@ -368,7 +368,86 @@ def dynamic_quantization(
     except Exception as e:
         logging.error(f"Quantization failed for {model_to_search_path} -> {out_path}: {e}")
         raise
+
+def _worker_wrapper(args_tuple: Tuple) -> Tuple[Any, Optional[Tuple[Dict[str, float], float]]]:
+    """
+    A wrapper to unpack arguments for a worker function, allowing it to be used
+    with multiprocessing.Pool.imap_unordered.
+
+    Args:
+        args_tuple: A tuple where the first element is an identifier (e.g., op_type, node_name)
+                    and the rest are the arguments for _worker_quant_and_benchmark.
+    
+    Returns:
+        A tuple containing the identifier and the result from the worker function.
+    """
+    identifier, worker_args = args_tuple[0], args_tuple[1:]
+    result = _worker_quant_and_benchmark(*worker_args)
+    return identifier, result
+
+def _worker_quant_and_benchmark(
+    exclusion_list: List[str],
+    model_to_search_path: Path,
+    part_name: str,
+    fixed_encoder_path: Path,
+    fixed_decoder_path: Path,
+    quant_type: Any,
+    quant_extra_options: Dict[str, Any],
+    run_benchmark_args: Dict[str, Any]
+) -> Optional[Tuple[Dict[str, float], float]]:
+    """
+    A top-level function for multiprocessing workers that is robust and process-safe.
+    It creates a fully isolated, ephemeral directory for each task, containing its own
+    copy of the source model to prevent race conditions during quantization.
+    """
+    pid = os.getpid()
+    task_id = f"worker_{pid}_{uuid.uuid4().hex[:8]}"
+    quant_test_dir = run_benchmark_args["quant_test_dir"]
+    
+    # Create a unique, ephemeral directory for the entire task.
+    task_temp_dir = quant_test_dir / "workers" / task_id
+    
+    try:
+        # 1. Create the dedicated directory for this task.
+        task_temp_dir.mkdir(parents=True, exist_ok=True)
+
+        # 2. Create a private copy of the source model for this task to work on.
+        #    This is CRUCIAL to prevent the shape inference race condition.
+        isolated_model_path = task_temp_dir / model_to_search_path.name
+        shutil.copy(model_to_search_path, isolated_model_path)
+
+        # 3. Define the output path for the quantized model within the same isolated directory.
+        quantized_model_path = task_temp_dir / f"{part_name}-quant.onnx"
+
+        # 4. Quantize using the ISOLATED source model. All temporary files (e.g., `-inferred.onnx`)
+        #    will now be safely created and deleted within this task's private directory.
+        dynamic_quantization(
+            model_to_search_path=isolated_model_path,
+            out_path=quantized_model_path,
+            quant_type=quant_type,
+            nodes_to_exclude=exclusion_list,
+            extra_options=quant_extra_options
+        )
+
+        # 5. Determine model paths for the benchmark run.
+        encoder_path = quantized_model_path if part_name == "encoder" else fixed_encoder_path
+        decoder_path = quantized_model_path if part_name == "decoder" else fixed_decoder_path
+
+        result = run_benchmark(encoder_path, decoder_path, **run_benchmark_args)
+        return result
         
+    except Exception as e:
+        logging.error(f"Task {task_id} failed for exclusion list size {len(exclusion_list)}: {e}", exc_info=True)
+        return None
+    finally:
+        # 6. Atomically clean up the entire temporary directory for the task.
+        #    This removes the copied source model and the quantized output, leaving no trace.
+        try:
+            if 'task_temp_dir' in locals() and task_temp_dir.exists():
+                shutil.rmtree(task_temp_dir)
+        except Exception as e_cleanup:
+            logging.warning(f"Task {task_id}: Failed to clean up directory {task_temp_dir}: {e_cleanup}")
+
 def _initialize_search_state(
     state_path: Path,
     part_name: str,
@@ -420,7 +499,7 @@ def _run_stage1_search(
     reference_score: float,
     minimize_metric: bool,
     primary_metric: str,
-    quant_and_benchmark: callable,
+    worker_args: Dict[str, Any],
     persist_state: callable
 ) -> Dict[str, Any]:
     """Executes the Stage 1 search to find sensitive operator types."""
@@ -428,7 +507,8 @@ def _run_stage1_search(
     candidate_op_types = cfg["candidate_op_types"]
     target = cfg["target"]
     resume_enabled = cfg.get("resume", False)
-    
+    multiprocessing_enabled = cfg.get("multiprocessing", False)
+
     # Unpack state variables that will be modified
     ops_remaining = state["ops_remaining"]
     cumulative_exclusion_nodes = state["cumulative_exclusion_nodes"]
@@ -437,8 +517,6 @@ def _run_stage1_search(
     tipping_point_score = state["tipping_point_score"]
     stage2_candidate_nodes = state["stage2_candidate_nodes"]
 
-    pbar_s1 = tqdm(ops_remaining, desc=f"Stage 1/{part_name}", unit="op", total=len(candidate_op_types))
-    
     # Common logic for handling a benchmark result and checking for a tipping point
     def check_for_tipping_point(op_type, current_score, nodes, last_score=None):
         fp32_level_met = (current_score <= reference_score) if minimize_metric else (current_score >= reference_score)
@@ -465,67 +543,123 @@ def _run_stage1_search(
 
         return False, None, None, None
 
-    # --- Strategy Implementations ---
-    last_score = baseline_score
-    best_overall_score = baseline_score
-    best_op_type, best_exclusion_list_for_op = None, []
+    # --- Strategy: 'best' with multiprocessing ---
+    if multiprocessing_enabled and strategy == 'best':
+        workers = cfg.get("workers") or os.cpu_count()
+        logging.info(f"🚀 Multiprocessing enabled for Stage 1 ('best' strategy) search with {workers} workers.")
 
-    for op_type in list(ops_remaining):
-        nodes_to_add = nodes_by_type.get(op_type, [])
-        if not nodes_to_add:
-            logging.info(f"  ℹ️  No nodes of type '{op_type}' found in {part_name.upper()}; skipping.")
-            per_op_results.append({"op_type": op_type, "node_count": 0, "score": None, "metrics": None})
-            ops_remaining.remove(op_type)
-            if resume_enabled: persist_state(stage=1, ops_left=ops_remaining, cumulative_nodes=cumulative_exclusion_nodes)
-            continue
+        tasks_with_op_types, ops_to_process = [], []
+        for op_type in ops_remaining:
+            nodes_to_add = nodes_by_type.get(op_type, [])
+            if not nodes_to_add:
+                logging.info(f"  ℹ️  No nodes of type '{op_type}' found in {part_name.upper()}; skipping.")
+                per_op_results.append({"op_type": op_type, "node_count": 0, "score": None, "metrics": None})
+                continue
+            
+            task_args = (
+                nodes_to_add,
+                worker_args["model_to_search_path"],
+                worker_args["part_name"],
+                worker_args["fixed_encoder_path"],
+                worker_args["fixed_decoder_path"],
+                worker_args["quant_type"],
+                worker_args["quant_extra_options"],
+                worker_args["run_benchmark_args"],
+            )
+            tasks_with_op_types.append((op_type,) + task_args)
+            ops_to_process.append(op_type)
         
-        pbar_s1.set_description(f"Stage 1/{part_name} (Testing {op_type}, {len(nodes_to_add)} nodes)")
+        op_results = {}
+        with multiprocessing.Pool(processes=workers) as pool:
+            result_iterator = pool.imap_unordered(_worker_wrapper, tasks_with_op_types)
+            for op_type, result in tqdm(result_iterator, total=len(tasks_with_op_types), desc=f"Stage 1/{part_name}", unit="op"):
+                op_results[op_type] = result
         
-        if strategy == 'best':
-            current_test_exclusion_list = nodes_to_add
-        else: # 'first' or 'percent'
-            current_test_exclusion_list = cumulative_exclusion_nodes + nodes_to_add
+        ops_remaining = []
 
-        try:
-            current_metrics, elapsed = quant_and_benchmark(current_test_exclusion_list)
-        except Exception:
-            logging.warning(f"Quant/benchmark failed for op type {op_type}. Skipping.", exc_info=True)
-            current_metrics, elapsed = {primary_metric: baseline_score}, 0.0
-        
-        current_score = current_metrics[primary_metric]
-        per_op_results.append({"op_type": op_type, "node_count": len(nodes_to_add), "score": current_score, "metrics": current_metrics, "time": elapsed})
-        logging.info(f"  Result for '{op_type}': {primary_metric.upper()}={current_score:.4f} ({len(nodes_to_add)} nodes)")
-        pbar_s1.set_postfix({primary_metric: f"{current_score:.4f}"})
-        
-        ops_remaining.remove(op_type)
-        if strategy in ['first', 'percent']:
-            cumulative_exclusion_nodes.extend(nodes_to_add)
+        best_overall_score = baseline_score
+        best_op_type, best_exclusion_list_for_op = None, []
 
+        for op_type in ops_to_process:
+            result = op_results.get(op_type)
+            nodes_for_op = nodes_by_type.get(op_type, [])
+            current_metrics, elapsed = result if result else ({primary_metric: baseline_score}, 0.0)
+            current_score = current_metrics[primary_metric]
+
+            per_op_results.append({"op_type": op_type, "node_count": len(nodes_for_op), "score": current_score, "metrics": current_metrics, "time": elapsed})
+            logging.info(f"  Result for '{op_type}': {primary_metric.upper()}={current_score:.4f} ({len(nodes_for_op)} nodes)")
+            
+            found, tp_op, tp_score, s2_nodes = check_for_tipping_point(op_type, current_score, nodes_for_op)
+            if found:
+                tipping_point_op_type, tipping_point_score, stage2_candidate_nodes = tp_op, tp_score, s2_nodes
+                break
+            
+            is_best = (current_score < best_overall_score) if minimize_metric else (current_score > best_overall_score)
+            if is_best:
+                best_overall_score, best_op_type, best_exclusion_list_for_op = current_score, op_type, nodes_for_op
+        
+        if not tipping_point_op_type and best_op_type:
+            tipping_point_op_type, tipping_point_score, stage2_candidate_nodes = best_op_type, best_overall_score, best_exclusion_list_for_op
+            logging.info(f"✅ Best tipping point found by excluding op type '{best_op_type}'.")
+        
         if resume_enabled:
-            persist_state(stage=1, ops_left=ops_remaining, cumulative_nodes=cumulative_exclusion_nodes)
+             persist_state(stage=2 if tipping_point_op_type else 1, ops_left=[], cumulative_nodes=[],
+                           stage2_nodes=stage2_candidate_nodes, best_list=stage2_candidate_nodes, best_score=tipping_point_score)
 
-        # Check for early exit conditions
-        found, tp_op, tp_score, s2_nodes = check_for_tipping_point(op_type, current_score, current_test_exclusion_list, last_score)
-        if found:
-            tipping_point_op_type, tipping_point_score, stage2_candidate_nodes = tp_op, tp_score, s2_nodes
-            if resume_enabled: persist_state(stage=2, stage2_nodes=s2_nodes, best_list=s2_nodes, best_score=tp_score)
-            break
+    # --- Sequential path for 'first', 'percent', and non-mp 'best' ---
+    else:
+        pbar_s1 = tqdm(ops_remaining, desc=f"Stage 1/{part_name}", unit="op", total=len(candidate_op_types))
+        last_score = baseline_score
+        best_overall_score = baseline_score
+        best_op_type, best_exclusion_list_for_op = None, []
+
+        for op_type in list(ops_remaining):
+            nodes_to_add = nodes_by_type.get(op_type, [])
+            if not nodes_to_add:
+                logging.info(f"  ℹ️  No nodes of type '{op_type}' found in {part_name.upper()}; skipping.")
+                per_op_results.append({"op_type": op_type, "node_count": 0, "score": None, "metrics": None})
+                ops_remaining.remove(op_type)
+                if resume_enabled: persist_state(stage=1, ops_left=ops_remaining, cumulative_nodes=cumulative_exclusion_nodes)
+                continue
+            
+            pbar_s1.set_description(f"Stage 1/{part_name} (Testing {op_type}, {len(nodes_to_add)} nodes)")
+            
+            current_test_exclusion_list = nodes_to_add if strategy == 'best' else cumulative_exclusion_nodes + nodes_to_add
+            
+            result = _worker_quant_and_benchmark(current_test_exclusion_list, **worker_args)
+            current_metrics, elapsed = result if result else ({primary_metric: baseline_score}, 0.0)
+            current_score = current_metrics[primary_metric]
+
+            per_op_results.append({"op_type": op_type, "node_count": len(nodes_to_add), "score": current_score, "metrics": current_metrics, "time": elapsed})
+            logging.info(f"  Result for '{op_type}': {primary_metric.upper()}={current_score:.4f} ({len(nodes_to_add)} nodes)")
+            pbar_s1.set_postfix({primary_metric: f"{current_score:.4f}"})
+            
+            ops_remaining.remove(op_type)
+            if strategy in ['first', 'percent']:
+                cumulative_exclusion_nodes.extend(nodes_to_add)
+
+            if resume_enabled:
+                persist_state(stage=1, ops_left=ops_remaining, cumulative_nodes=cumulative_exclusion_nodes)
+
+            found, tp_op, tp_score, s2_nodes = check_for_tipping_point(op_type, current_score, current_test_exclusion_list, last_score)
+            if found:
+                tipping_point_op_type, tipping_point_score, stage2_candidate_nodes = tp_op, tp_score, s2_nodes
+                if resume_enabled: persist_state(stage=2, stage2_nodes=s2_nodes, best_list=s2_nodes, best_score=tp_score)
+                break
+            
+            last_score = current_score
+            if strategy == 'best':
+                is_best = (current_score < best_overall_score) if minimize_metric else (current_score > best_overall_score)
+                if is_best:
+                    best_overall_score, best_op_type, best_exclusion_list_for_op = current_score, op_type, nodes_to_add
+                    logging.info(f"  Found new best score by excluding '{op_type}'.")
         
-        # Update state for next iteration
-        last_score = current_score
-        if strategy == 'best':
-            is_best_so_far = (current_score < best_overall_score) if minimize_metric else (current_score > best_overall_score)
-            if is_best_so_far:
-                best_overall_score, best_op_type, best_exclusion_list_for_op = current_score, op_type, nodes_to_add
-                logging.info(f"  Found new best score by excluding '{op_type}'.")
-    
-    pbar_s1.close()
+        pbar_s1.close()
 
-    # Finalize 'best' strategy if no early stop occurred
-    if strategy == 'best' and not tipping_point_op_type and best_op_type:
-        logging.info(f"✅ Best tipping point found by excluding op type '{best_op_type}'.")
-        tipping_point_op_type, tipping_point_score, stage2_candidate_nodes = best_op_type, best_overall_score, best_exclusion_list_for_op
-        if resume_enabled: persist_state(stage=2, stage2_nodes=stage2_candidate_nodes, best_list=stage2_candidate_nodes, best_score=best_overall_score)
+        if strategy == 'best' and not tipping_point_op_type and best_op_type:
+            logging.info(f"✅ Best tipping point found by excluding op type '{best_op_type}'.")
+            tipping_point_op_type, tipping_point_score, stage2_candidate_nodes = best_op_type, best_overall_score, best_exclusion_list_for_op
+            if resume_enabled: persist_state(stage=2, stage2_nodes=stage2_candidate_nodes, best_list=stage2_candidate_nodes, best_score=best_overall_score)
 
     return {
         "tipping_point_op_type": tipping_point_op_type,
@@ -540,8 +674,8 @@ def _run_stage2_pruning(
     part_name: str,
     minimize_metric: bool,
     primary_metric: str,
-    quant_and_benchmark: callable,
-    persist_state: callable
+    worker_args: Dict[str, Any],
+    persist_state: callable,
 ) -> Tuple[List[str], float]:
     """Executes the Stage 2 pruning process to minimize the exclusion list."""
     strategy = cfg["strategy_stage2"]
@@ -559,6 +693,12 @@ def _run_stage2_pruning(
         logging.info(f"Will stop pruning if the exclusion list has {max_nodes_to_exclude} or fewer nodes.")
     logging.info(f"Initial {primary_metric.upper()} with all nodes: {current_best_score:.4f}")
 
+    multiprocessing_enabled = cfg.get("multiprocessing", False)
+    if multiprocessing_enabled:
+        workers = cfg.get("workers") or os.cpu_count()
+        logging.info(f"🚀 Multiprocessing enabled for Stage 2 search with {workers} workers.")
+
+    initial_node_count = len(stage2_candidate_nodes)
     changed_in_pass = True
     pass_num = 0
     while changed_in_pass and (max_nodes_to_exclude is None or len(best_exclusion_list) > max_nodes_to_exclude):
@@ -568,46 +708,106 @@ def _run_stage2_pruning(
         if not nodes_to_test_this_pass: break
         
         logging.info(f"--- Pruning Pass #{pass_num} ({len(nodes_to_test_this_pass)} nodes left) ---")
-        pbar_s2 = tqdm(nodes_to_test_this_pass, desc=f"Stage 2/{part_name}", unit="node", leave=False)
 
-        for node in list(nodes_to_test_this_pass):
-            pbar_s2.set_description(f"Stage 2/{part_name} (Test remove: {node.split('/')[-1]})")
+        # Multiprocessing path (multiprocessing=True)
+        if multiprocessing_enabled:
+            tasks_with_nodes = []
+            for node in nodes_to_test_this_pass:
+                temp_exclusion_list = [n for n in best_exclusion_list if n != node]
+                task_args = (
+                    temp_exclusion_list,
+                    worker_args["model_to_search_path"],
+                    worker_args["part_name"],
+                    worker_args["fixed_encoder_path"],
+                    worker_args["fixed_decoder_path"],
+                    worker_args["quant_type"],
+                    worker_args["quant_extra_options"],
+                    worker_args["run_benchmark_args"],
+                )
+                tasks_with_nodes.append((node,) + task_args)
             
-            # Create a temporary list for testing
-            temp_exclusion_list = [n for n in best_exclusion_list if n != node]
-            
-            try:
-                metrics, _ = quant_and_benchmark(temp_exclusion_list)
-                score = metrics[primary_metric]
-                logging.info(f"  Test removing node '{node}' -> {primary_metric.upper()}: {score:.4f}")
+            with multiprocessing.Pool(processes=workers) as pool:
+                result_iterator = pool.imap_unordered(_worker_wrapper, tasks_with_nodes)
+                pbar_s2 = tqdm(
+                    result_iterator,
+                    desc=f"Stage 2/{part_name}",
+                    unit="node",
+                    leave=False,
+                    total=initial_node_count,
+                    initial=initial_node_count - len(nodes_to_test_this_pass)
+                )
 
-                eps = 1e-6
-                can_be_removed = False
-                if strategy == 'relaxed' and ( (minimize_metric and score <= current_best_score + eps) or (not minimize_metric and score >= current_best_score - eps) ):
-                    can_be_removed = True
-                elif strategy == 'strict' and ( (minimize_metric and score < current_best_score - eps) or (not minimize_metric and score > current_best_score - eps) ):
-                    can_be_removed = True
-                
-                if can_be_removed:
-                    logging.info(f"✅ Node '{node}' removed. New {primary_metric.upper()}: {score:.4f}")
-                    best_exclusion_list = temp_exclusion_list
-                    current_best_score = score
-                    changed_in_pass = True
-                    # A node was removed, so the next pass will start with a fresh full list
-                    nodes_left_for_pass = [] 
-                    if resume_enabled: persist_state(stage=2, best_list=best_exclusion_list, best_score=current_best_score, nodes_left_for_stage2=nodes_left_for_pass)
-                    break # Exit the for-loop to start a new pass
+                for node, result in pbar_s2:
+                    if result is None:
+                        logging.warning(f"Quant/benchmark failed when testing removal of node {node}. Re-adding node.")
+                        continue
+
+                    metrics, _ = result
+                    score = metrics[primary_metric]
+                    logging.info(f"  Test removing node '{node}' -> {primary_metric.upper()}: {score:.4f}")
+                    
+                    eps = 1e-6
+                    can_be_removed = (strategy == 'relaxed' and ((minimize_metric and score <= current_best_score + eps) or (not minimize_metric and score >= current_best_score - eps))) or \
+                                     (strategy == 'strict' and ((minimize_metric and score < current_best_score - eps) or (not minimize_metric and score > current_best_score - eps)))
+
+                    if can_be_removed:
+                        logging.info(f"✅ Node '{node}' removed. New {primary_metric.upper()}: {score:.4f}")
+                        best_exclusion_list = [n for n in best_exclusion_list if n != node]
+                        current_best_score = score
+                        changed_in_pass = True
+                        nodes_left_for_pass = [] 
+                        if resume_enabled: persist_state(stage=2, best_list=best_exclusion_list, best_score=current_best_score, nodes_left_for_stage2=nodes_left_for_pass)
+                        pbar_s2.close()
+                        break 
+                    else:
+                        logging.info(f"❌ Node '{node}' cannot be removed without worsening the metric.")
                 else:
-                    logging.info(f"❌ Node '{node}' cannot be removed without worsening the metric; re-adding it.")
+                    # This block executes if the for loop completes without a `break`.
+                    # This means no node could be removed in this pass.
+                    nodes_left_for_pass = []
+                    if resume_enabled: persist_state(stage=2, best_list=best_exclusion_list, best_score=current_best_score, nodes_left_for_stage2=nodes_left_for_pass)
+
+        # Sequential path (multiprocessing=False)
+        else:
+            num_initial_candidates = len(stage2_candidate_nodes)
+            pbar_s2 = tqdm(
+                nodes_to_test_this_pass,
+                desc=f"Stage 2/{part_name}", unit="node", leave=False,
+                total=num_initial_candidates,
+                initial=num_initial_candidates - len(nodes_to_test_this_pass)
+            )
+            for node in pbar_s2:
+                pbar_s2.set_description(f"Stage 2/{part_name} (Test remove: {node.split('/')[-1]})")
+                temp_exclusion_list = [n for n in best_exclusion_list if n != node]
+                
+                result = _worker_quant_and_benchmark(temp_exclusion_list, **worker_args)
+                
+                if result is None:
+                    logging.warning(f"Quant/benchmark failed when testing removal of node {node}. Re-adding node.")
+                else:
+                    metrics, _ = result
+                    score = metrics[primary_metric]
+                    logging.info(f"  Test removing node '{node}' -> {primary_metric.upper()}: {score:.4f}")
+
+                    eps = 1e-6
+                    can_be_removed = (strategy == 'relaxed' and ((minimize_metric and score <= current_best_score + eps) or (not minimize_metric and score >= current_best_score - eps))) or \
+                                     (strategy == 'strict' and ((minimize_metric and score < current_best_score - eps) or (not minimize_metric and score > current_best_score - eps)))
+                    
+                    if can_be_removed:
+                        logging.info(f"✅ Node '{node}' removed. New {primary_metric.upper()}: {score:.4f}")
+                        best_exclusion_list = temp_exclusion_list
+                        current_best_score = score
+                        changed_in_pass = True
+                        nodes_left_for_pass = [] 
+                        if resume_enabled: persist_state(stage=2, best_list=best_exclusion_list, best_score=current_best_score, nodes_left_for_stage2=nodes_left_for_pass)
+                        break
+                    else:
+                        logging.info(f"❌ Node '{node}' cannot be removed without worsening the metric; re-adding it.")
+                
+                nodes_left_for_pass = [n for n in nodes_to_test_this_pass if n != node]
+                if resume_enabled: persist_state(stage=2, best_list=best_exclusion_list, best_score=current_best_score, nodes_left_for_stage2=nodes_left_for_pass)
             
-            except Exception:
-                logging.warning(f"Quant/benchmark failed when testing removal of node {node}. Re-adding node.", exc_info=True)
-            
-            # This node was tested and not removed, update the list of nodes left for this pass
-            nodes_left_for_pass = [n for n in nodes_to_test_this_pass if n != node]
-            if resume_enabled: persist_state(stage=2, best_list=best_exclusion_list, best_score=current_best_score, nodes_left_for_stage2=nodes_left_for_pass)
-        
-        pbar_s2.close()
+            pbar_s2.close()
 
     if max_nodes_to_exclude is not None and len(best_exclusion_list) > max_nodes_to_exclude:
          logging.warning(f"Pruning finished, but the exclusion list ({len(best_exclusion_list)} nodes) is larger than the max ({max_nodes_to_exclude}).")
@@ -666,33 +866,24 @@ def find_optimal_exclusions(
             _save_state_atomic(state_path, data_to_save)
         except Exception as e:
             logging.warning(f"Failed to persist search state to {state_path}: {e}")
-
-    def quant_and_benchmark(exclusion_list: List[str]) -> Tuple[Dict[str, float], float]:
-        """A wrapper to abstract away the temp file management and benchmarking call."""
-        with tempfile.NamedTemporaryFile(suffix=".onnx", dir=quant_test_dir, delete=False) as temp_model_file:
-            temp_model_path = Path(temp_model_file.name)
-        
-        try:
-            dynamic_quantization(
-                model_to_search_path=model_to_search_path,
-                out_path=temp_model_path,
-                quant_type=quant_type,
-                nodes_to_exclude=exclusion_list,
-                extra_options=quant_extra_options
-            )
-            encoder_path = temp_model_path if part_name == "encoder" else fixed_encoder_path
-            decoder_path = temp_model_path if part_name == "decoder" else fixed_decoder_path
-            return run_benchmark(encoder_path, decoder_path, **run_benchmark_args)
-        finally:
-            if temp_model_path.exists():
-                os.unlink(temp_model_path)
+    
+    # Collect all arguments needed for the standalone worker function
+    worker_args = {
+        "model_to_search_path": model_to_search_path,
+        "part_name": part_name,
+        "fixed_encoder_path": fixed_encoder_path,
+        "fixed_decoder_path": fixed_decoder_path,
+        "quant_type": quant_type,
+        "quant_extra_options": quant_extra_options,
+        "run_benchmark_args": run_benchmark_args
+    }
 
     # 3. Run Stage 1: Sensitivity Search
     if not state["stage1_skipped_due_to_resume"]:
         logging.info(f"--- STAGE 1: Discovering Sensitive Operation Types for {part_name.upper()} (Strategy: {cfg['strategy_stage1']}) ---")
         stage1_results = _run_stage1_search(
             state, cfg, part_name, nodes_by_type, baseline_score, reference_score,
-            minimize_metric, primary_metric, quant_and_benchmark, persist_state
+            minimize_metric, primary_metric, worker_args, persist_state
         )
         # Update state with results from stage 1
         state.update(stage1_results)
@@ -709,10 +900,16 @@ def find_optimal_exclusions(
     
     logging.info(f"\n✅ Stage 1 for {part_name.upper()} Complete. Tipping point: '{state['tipping_point_op_type']}'. Pool for Stage 2 has {len(state['stage2_candidate_nodes'])} nodes.\n")
     
+    # Clean up stage-1 temp artifacts to avoid disk bloat before starting stage 2.
+    try:
+        _cleanup_stage1_temp_dirs(quant_test_dir)
+    except Exception as e:
+        logging.warning(f"Stage 1 cleanup failed: {e}")
+
     # 5. Run Stage 2: Pruning
     final_exclusion_list, final_score = _run_stage2_pruning(
         state, cfg, part_name, minimize_metric, primary_metric,
-        quant_and_benchmark, persist_state
+        worker_args, persist_state
     )
 
     # 6. Finalization and Cleanup
@@ -726,3 +923,62 @@ def find_optimal_exclusions(
         _remove_state(state_path)
 
     return final_exclusion_list, final_score
+
+def apply_quantization_from_exclusions_file(
+    exclusions_file: Path,
+    export_dir: Path,
+    onnx_dir: Path,
+    cfg: dict
+):
+    """
+    Skips the search, reads exclusions from a file, and quantizes the models to UINT8.
+    """
+    logging.info(f"Applying exclusions from: {exclusions_file}")
+    logging.info("Search will be skipped.")
+
+    # Load exclusion data from the results file
+    try:
+        with open(exclusions_file, 'r', encoding='utf-8') as f:
+            line = f.readline() # Handles JSONL format with a single line
+            results_data = json.loads(line)
+        encoder_exclusion_list = results_data.get("encoder_nodes_to_exclude", [])
+        decoder_exclusion_list = results_data.get("decoder_nodes_to_exclude", [])
+        logging.info(f"Found {len(encoder_exclusion_list)} nodes to exclude for the encoder.")
+        logging.info(f"Found {len(decoder_exclusion_list)} nodes to exclude for the decoder.")
+    except Exception as e:
+        logging.error(f"Failed to read or parse exclusion file {exclusions_file}: {e}")
+        sys.exit(1)
+
+    # Get paths and quantization settings
+    fp32_encoder_path = onnx_dir / cfg["fp32_encoder"]
+    fp32_decoder_path = onnx_dir / cfg["fp32_decoder"]
+    
+    if cfg.get("quant_type") == "QInt8":
+        quant_type = QuantType.QInt8
+        quant_suffix = "qint8"
+    else:
+        # Default to QUInt8
+        quant_type = QuantType.QUInt8
+        quant_suffix = "quint8"
+    quant_extra_options = {"EnableSubgraph": cfg.get("enable_subgraph", True)}
+
+    # Perform the quantization and export
+    try:
+        export_dir.mkdir(parents=True, exist_ok=True)
+        logging.info(f"\nExporting final quantized models to {export_dir}...")
+
+        final_quant_encoder_path = export_dir / (fp32_encoder_path.stem + f".{quant_suffix}_dynamic_final.onnx")
+        final_quant_decoder_path = export_dir / (fp32_decoder_path.stem + f".{quant_suffix}_dynamic_final.onnx")
+
+        logging.info(f"Quantizing encoder with {len(encoder_exclusion_list)} excluded nodes...")
+        dynamic_quantization(fp32_encoder_path, final_quant_encoder_path, quant_type, encoder_exclusion_list, quant_extra_options)
+        logging.info(f"  -> Saved to {final_quant_encoder_path}")
+
+        logging.info(f"Quantizing decoder with {len(decoder_exclusion_list)} excluded nodes...")
+        dynamic_quantization(fp32_decoder_path, final_quant_decoder_path, quant_type, decoder_exclusion_list, quant_extra_options)
+        logging.info(f"  -> Saved to {final_quant_decoder_path}")
+        logging.info("✅ Final model export complete.")
+
+    except Exception as e:
+        logging.error(f"\n❌ Failed to export final ONNX models to {export_dir}: {e}")
+        sys.exit(1)
