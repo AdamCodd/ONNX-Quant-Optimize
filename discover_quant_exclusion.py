@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # discover_quant_exclusions.py
 
 """
@@ -22,7 +21,7 @@ from quant_utils import (
     load_samples_from_jsonl, get_filesize_mb
 )
 from quant_engine import (
-    run_benchmark, dynamic_quantization, find_optimal_exclusions,
+    run_benchmark, dynamic_quantization, find_optimal_exclusions, apply_quantization_from_exclusions_file,
     HIGHER_IS_BETTER_METRICS
 )
 
@@ -35,32 +34,34 @@ if __name__ == "__main__":
     
     # ==== DEFAULTS (overridden by config file) ====
     DEFAULTS = {
-        "model_reference": "safetensors",
-        "model_dir": ".",
-        "onnx_dir": "onnx-model",
-        "quant_test_dir": "onnx-quant-discovery",
-        "fp32_encoder": "encoder_model.onnx",
-        "fp32_decoder": "decoder_model_merged.onnx",
-        "execution_provider": "CPUExecutionProvider",
-        "quant_type": "QUInt8",
-        "search_target": "both",
-        "max_generation_length": 100,
-        "samples_jsonl": "samples.jsonl",
-        "task": "text2text-generation",
-        "with-past": True,
-        "enable_subgraph": True,
-        "metrics": ["wer", "cer"],
-        "primary_metric": "wer",
         "candidate_op_types": [
             "Gather", "Gemm", "MatMul", "Add", "Sub", "Mul", "Softmax", "LayerNormalization",
             "Gelu", "Div", "Exp", "Pow", "Sqrt", "ReduceMean", "Slice", "Unsqueeze",
             "Transpose", "Concat", "Reshape", "Cast"
         ],
-        "target": None,
+        "enable_subgraph": True,
+        "execution_provider": "CPUExecutionProvider",
+        "fp32_decoder": "decoder_model_merged.onnx",
+        "fp32_encoder": "encoder_model.onnx",
+        "max_generation_length": 100,
+        "max_nodes_to_exclude": None,
+        "metrics": ["wer", "cer"],
+        "model_dir": ".",
+        "model_reference": "safetensors",
+        "multiprocessing": True,
+        "onnx_dir": "onnx-model",
+        "primary_metric": "wer",
+        "quant_test_dir": "onnx-quant-discovery",
+        "quant_type": "QUInt8",
+        "resume": False,
+        "samples_jsonl": "samples.jsonl",
+        "search_target": "both",
         "strategy_stage1": "first",
         "strategy_stage2": "relaxed",
-        "max_nodes_to_exclude": None,
-        "resume": False
+        "target": None,
+        "task": "text2text-generation",
+        "with-past": True,
+        "workers": None # None means autodetect
     }
 
     script_start_time = time.perf_counter()
@@ -71,13 +72,14 @@ if __name__ == "__main__":
     parser.add_argument("--config", "-c", type=str, default=str(script_dir / "config_quant.json"), help="Path to JSON config file (overrides defaults).")
     parser.add_argument("--results", type=str, default=str(script_dir / "results.jsonl"), help="Path to export the final exclusion lists as a JSONL file.")
     parser.add_argument("--export_final", type=str, help="Path to a directory to export the final quantized ONNX models with the discovered exclusions.")
+    parser.add_argument("--export_excluded", type=str, help="Path to a results.jsonl file. Skips the search and applies the exclusions from this file to quantize the model.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout)
 
     # Add file handler to log everything to a file in the script directory
     log_file_path = script_dir / "quant-optimizer.log"
-    file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+    file_handler = logging.FileHandler(log_file_path, mode='w', encoding="utf-8")
     file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     root_logger.addHandler(file_handler)
 
@@ -116,32 +118,8 @@ if __name__ == "__main__":
     TARGET = cfg["target"]
     DEVICE = "cpu" if EXECUTION_PROVIDER == "CPUExecutionProvider" else "cuda"
 
-    logging.info(f"Search Target: '{SEARCH_TARGET}'")
-    logging.info(f"Using Stage 1 strategy: '{cfg['strategy_stage1']}'")
-    if cfg['strategy_stage1'] == "percent":
-        if TARGET is None or not (0.0 <= TARGET <= 1.0):
-            raise ValueError("For 'percent' strategy, 'target' must be set in the config file as a float between 0.0 and 1.0.")
-
-    if QUANT_TYPE_STR == "QUInt8":
-        quant_type, quant_suffix = QuantType.QUInt8, "quint8"
-    elif QUANT_TYPE_STR == "QInt8":
-        quant_type, quant_suffix = QuantType.QInt8, "qint8"
-    else:
-        raise ValueError(f"Unsupported 'quant_type' in config: '{QUANT_TYPE_STR}'. Must be 'QUInt8' or 'QInt8'.")
-
-    expanded_primary_metrics = ['rouge1', 'rouge2', 'rougeL', 'rougeLsum'] if 'rouge' in METRICS else []
-    expanded_primary_metrics.extend([m for m in METRICS if m != 'rouge'])
-    if PRIMARY_METRIC not in expanded_primary_metrics:
-        raise ValueError(f"Primary metric '{PRIMARY_METRIC}' must be one of the tested metrics: {expanded_primary_metrics}")
-
-    minimize_metric = PRIMARY_METRIC not in HIGHER_IS_BETTER_METRICS
-
-    fp32_encoder_path, fp32_decoder_path = ONNX_DIR / cfg["fp32_encoder"], ONNX_DIR / cfg["fp32_decoder"]
-    ONNX_DIR.mkdir(parents=True, exist_ok=True)
-    QUANT_TEST_DIR.mkdir(parents=True, exist_ok=True)
-
     if cfg["model_reference"] in ("safetensors", "pytorch", "pt"):
-        if not fp32_encoder_path.exists() or not fp32_decoder_path.exists():
+        if not (ONNX_DIR / cfg["fp32_encoder"]).exists() or not (ONNX_DIR / cfg["fp32_decoder"]).exists():
             logging.info(f"Exporting PyTorch/safetensors model from '{MODEL_DIR}' to ONNX in '{ONNX_DIR}'...")
             try:
                 from optimum.exporters.onnx import main_export
@@ -167,17 +145,27 @@ if __name__ == "__main__":
     else:
         logging.warning(f"Unknown model_reference '{cfg['model_reference']}'. If your reference is a PyTorch model, set 'model_reference' to 'pytorch' or 'safetensors' in the config.")
 
+    fp32_encoder_path, fp32_decoder_path = ONNX_DIR / cfg["fp32_encoder"], ONNX_DIR / cfg["fp32_decoder"]
+    ONNX_DIR.mkdir(parents=True, exist_ok=True)
+    QUANT_TEST_DIR.mkdir(parents=True, exist_ok=True)
+
     if not fp32_encoder_path.exists() or not fp32_decoder_path.exists():
         raise FileNotFoundError(
             f"Missing FP32 ONNX model. Check paths in config: {fp32_encoder_path}, {fp32_decoder_path} "
             f"or set 'model_reference' to 'pytorch'|'safetensors' (to export from MODEL_DIR) or 'onnx-fp32' (if ONNX already present)."
         )
 
+    # --- Pre-load assets for either workflow ---
+    if QUANT_TYPE_STR == "QUInt8":
+        quant_type, quant_suffix = QuantType.QUInt8, "quint8"
+    elif QUANT_TYPE_STR == "QInt8":
+        quant_type, quant_suffix = QuantType.QInt8, "qint8"
+    else:
+        raise ValueError(f"Unsupported 'quant_type' in config: '{QUANT_TYPE_STR}'. Must be 'QUInt8' or 'QInt8'.")
+
     tokenizer, config = AutoTokenizer.from_pretrained(str(MODEL_DIR)), AutoConfig.from_pretrained(str(MODEL_DIR))
     samples = load_samples_from_jsonl(samples_jsonl)
     logging.info(f"Loaded {len(samples)} sample(s) from {samples_jsonl} for benchmarking.\n")
-    
-    quant_extra_options = {"EnableSubgraph": cfg["enable_subgraph"]}
     
     run_benchmark_args = {
         "tokenizer": tokenizer, "config": config, "samples": samples,
@@ -186,6 +174,61 @@ if __name__ == "__main__":
         "quant_test_dir": QUANT_TEST_DIR
     }
 
+    # Handle direct quantization from exclusions file and run comparison
+    if args.export_excluded:
+        export_dir = script_dir / "onnx_excluded"
+        if args.export_final:
+            export_dir = Path(args.export_final)
+        
+        # Apply the quantization using the provided exclusion file
+        apply_quantization_from_exclusions_file(
+            exclusions_file=Path(args.export_excluded),
+            export_dir=export_dir,
+            onnx_dir=ONNX_DIR,
+            cfg=cfg
+        )
+        
+        # --- Run comparison benchmark ---
+        logging.info("\n" + "="*20 + " BENCHMARK COMPARISON " + "="*20)
+        
+        # 1. Benchmark FP32 model
+        logging.info("🔬 Benchmarking FP32 ONNX Model (Reference)...")
+        reference_metrics, reference_time = run_benchmark(fp32_encoder_path, fp32_decoder_path, **run_benchmark_args)
+        logging.info(f"✅ Reference (FP32) Metrics: {json.dumps({k: round(v, 4) for k, v in reference_metrics.items()})}")
+        logging.info(f"✅ Inference Time: {reference_time:.4f}s")
+
+        # 2. Benchmark newly quantized model
+        logging.info(f"🔬 Benchmarking Quantized ONNX Model from {export_dir}...")
+        quant_encoder_path = export_dir / (fp32_encoder_path.stem + f".{quant_suffix}_dynamic_final.onnx")
+        quant_decoder_path = export_dir / (fp32_decoder_path.stem + f".{quant_suffix}_dynamic_final.onnx")
+        
+        if not quant_encoder_path.exists() or not quant_decoder_path.exists():
+            logging.error(f"Quantized models not found in {export_dir}. Cannot run benchmark.")
+        else:
+            quant_metrics, quant_time = run_benchmark(quant_encoder_path, quant_decoder_path, **run_benchmark_args)
+            logging.info(f"✅ Quantized Metrics: {json.dumps({k: round(v, 4) for k, v in quant_metrics.items()})}")
+            logging.info(f"✅ Inference Time: {quant_time:.4f}s")
+            logging.info("="*62)
+
+        script_end_time = time.perf_counter()
+        logging.info(f"Total script execution time: {script_end_time - script_start_time:.2f} seconds.")
+        sys.exit(0)
+
+    # --- The rest of the script remains unchanged for the search workflow ---
+    logging.info(f"Search Target: '{SEARCH_TARGET}'")
+    logging.info(f"Using Stage 1 strategy: '{cfg['strategy_stage1']}'")
+    if cfg['strategy_stage1'] == "percent":
+        if TARGET is None or not (0.0 <= TARGET <= 1.0):
+            raise ValueError("For 'percent' strategy, 'target' must be set in the config file as a float between 0.0 and 1.0.")
+
+    expanded_primary_metrics = ['rouge1', 'rouge2', 'rougeL', 'rougeLsum'] if 'rouge' in METRICS else []
+    expanded_primary_metrics.extend([m for m in METRICS if m != 'rouge'])
+    if PRIMARY_METRIC not in expanded_primary_metrics:
+        raise ValueError(f"Primary metric '{PRIMARY_METRIC}' must be one of the tested metrics: {expanded_primary_metrics}")
+
+    minimize_metric = PRIMARY_METRIC not in HIGHER_IS_BETTER_METRICS
+    quant_extra_options = {"EnableSubgraph": cfg["enable_subgraph"]}
+    
     logging.info("🔬 Benchmarking FP32 ONNX Model (Reference)...")
     reference_metrics, reference_time = run_benchmark(fp32_encoder_path, fp32_decoder_path, **run_benchmark_args)
     REFERENCE_SCORE = reference_metrics[PRIMARY_METRIC]
@@ -325,7 +368,7 @@ if __name__ == "__main__":
         final_metrics, final_time = run_benchmark(final_quant_encoder_path, final_quant_decoder_path, **run_benchmark_args)
         final_quant_filesize = get_filesize_mb(final_quant_encoder_path, final_quant_decoder_path)
         delta_baseline = final_metrics[PRIMARY_METRIC] - REFERENCE_SCORE
-        logging.info(f"✅ Final Optimized Metrics: {json.dumps({k: round(v, 4) for k, v in final_metrics.items})}")
+        logging.info(f"✅ Final Optimized Metrics: {json.dumps({k: round(v, 4) for k, v in final_metrics.items()})}")
         logging.info(f"✅ Inference Time: {final_time:.4f}s, Size: {final_quant_filesize:.2f}MB")
         logging.info(f"✅ Delta from FP32 Baseline ({PRIMARY_METRIC.upper()}): {delta_baseline:+.4f}")
 
