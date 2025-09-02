@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Optional
 
@@ -116,3 +117,20 @@ def _remove_state(path: Path) -> None:
         if path.exists(): path.unlink()
     except Exception:
         pass
+
+def _cleanup_stage1_temp_dirs(quant_test_dir: Path) -> None:
+    """
+    Remove leftover temporary directories created during Stage 1 that do not match
+    the per-process worker dir naming (worker_{pid}). This helps free disk space
+    before starting Stage 2. Non-fatal on errors (logs warnings).
+    """
+    if not quant_test_dir.exists():
+        return
+    for item in quant_test_dir.iterdir():
+        try:
+            if item.is_dir() and not item.name.startswith("worker_"):
+                # remove directory and all contents
+                shutil.rmtree(item)
+                logging.info(f"Removed Stage 1 temp dir: {item}")
+        except Exception as e:
+            logging.warning(f"Failed to remove temp directory {item}: {e}")
