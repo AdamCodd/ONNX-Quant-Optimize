@@ -31,6 +31,8 @@ Supports multiprocessing to speed up the process.
 *   Transformers
 *   Optimum
 *   Additional libraries for metrics: `jiwer` for WER/CER and `evaluate` for BLEU/ROUGE.
+  
+I recommend using a RAM disk for `quant_test_dir`, as the process can write several terabytes of data in a single run and prematurely wear out your SSD/HDD.
 
 ### Installation
 
@@ -73,9 +75,23 @@ or if you're testing on GPU:
 
 The script is controlled by a `config_quant.json` file. Here are some of the key options:
 
+*   `"candidate_op_types"`: A list of ONNX operator types to consider for exclusion during the search.
+*   `"enable_subgraph"`: A boolean that corresponds to the EnableSubgraph extra option in ONNX Runtime quantization.
+*   `"execution_provider"`: The ONNX Runtime execution provider to use for inference (e.g., "CPUExecutionProvider" or "CUDAExecutionProvider").
+*   `"fp32_decoder"`: The filename of the FP32 ONNX decoder model inside the "onnx_dir".
+*   `"fp32_encoder"`: The filename of the FP32 ONNX encoder model inside the "onnx_dir".
+*   `"max_generation_length"`: The maximum number of new tokens to generate during the evaluation benchmark.
+*   `"max_nodes_to_exclude"`: An optional integer. If set, the Stage 2 pruning process will stop early if the number of excluded nodes becomes less than or equal to this value.
+*   `"metrics"`: A list of metrics to evaluate. Options: "wer", "cer", "bleu", "rouge".
 *   `"model_dir"`: Path to the directory containing the source model (e.g., in Hugging Face format).
+*   `"model_reference"`: The format of the reference model. Options: `safetensors`, `pytorch` or `onnx-fp32`.
+*   `"multiprocessing"`: A boolean flag to enable or disable the use of multiple processes for parallelizing the quantization and benchmarking tasks.
 *   `"onnx_dir"`: Directory to save the exported ONNX models.
+*   `"primary_metric"`: The main metric to use for optimization decisions.
 *   `"quant_test_dir"`: A temporary directory for intermediate quantized models.
+*   `"quant_type"`: The target data type for quantization. Supported options are "QInt8" and "QUInt8".
+*   `"resume"`: A boolean. If true, the script will attempt to load a _search_state.json file from the quant_test_dir to resume a previously interrupted search.
+*   `"samples_jsonl"`: The file path to a JSONL file containing samples for evaluation. Each line should be a JSON object with input prompts and ground truth references.
 *   `"search_target"`: The part of the model to search. Options: `"encoder"`, `"decoder"`, `"both"`.
 *   `"metrics"`: A list of metrics to evaluate. Options: `"wer"`, `"cer"`, `"bleu"`, `"rouge"`.
 *   `"primary_metric"`: The main metric to use for optimization decisions.
@@ -86,6 +102,10 @@ The script is controlled by a `config_quant.json` file. Here are some of the key
 *   `"strategy_stage2"`: The strategy for the pruning stage. Options:
     *   `"relaxed"`: A node is kept excluded if removing it doesn't degrade performance below the "tipping point" score from Stage 1.
     *   `"strict"`: A node is kept excluded only if removing it degrades the *current best* score.
+*   `"target"`: A float value (e.g., 0.5 for 50%) used only with the "percent" strategy for Stage 1. It defines the target percentage of the performance gap to recover.
+*   `"task"`: A string describing the model's task, used for metadata (e.g., "text2text-generation").
+*   `"with-past"`: A boolean to indicate whether the model should be exported with support for past key-value caches for faster generation. Only for decoders.
+*   `"workers"`: The number of worker processes to use when "multiprocessing" is enabled. If set to null, it'll automatically use `max(1, os.cpu_count() // 2)` workers.
 
 ## Example Output
 
@@ -116,4 +136,3 @@ QUInt8 Dynamic (Partially Quantized)    8.5678    -6.667s (x0.56)      0.1255   
 
 ## Current limitations
 * Only encoder-decoders models. It needs to be extended to encoder and decoder only models.
-* Needs a lot of space for the intermediate onnx files when there are many nodes to check.
