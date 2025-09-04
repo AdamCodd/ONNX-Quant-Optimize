@@ -27,6 +27,12 @@ logging.getLogger().addFilter(SuppressQuantFilter())
 # ==== CONSTANTS ====
 HIGHER_IS_BETTER_METRICS = {"accuracy", "bleu", "rouge", "rouge1", "rouge2", "rougeL", "rougeLsum"}
 
+# Force single-threaded numerical libraries to avoid oversubscription
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 def find_logits_output(output_infos: List[Any], vocab_size: Optional[int] = None) -> str:
     """
     Heuristic to locate logits output name from decoder session outputs.
@@ -158,8 +164,6 @@ def run_benchmark(
 ) -> Tuple[Dict[str, float], float]:
     """
     Runs inference on an encoder-decoder ONNX model pair and returns a dictionary of averaged metrics and the inference time.
-    Inference is performed in a single batch for all samples to improve performance.
-
     NOTE: This function expects encoder_path and decoder_path to point to ONNX files.
     """
     # Conditionally import evaluation libraries based on requested metrics
@@ -221,7 +225,6 @@ def run_benchmark(
 
         inference_start_time = time.perf_counter()
 
-        # Encoder forward
         encoder_hidden_states = encoder_sess.run(None, {"input_ids": input_ids, "attention_mask": attention_mask})[0]
         
         # ---- DECODER SETUP ----
@@ -370,17 +373,6 @@ def dynamic_quantization(
         raise
 
 def _worker_wrapper(args_tuple: Tuple) -> Tuple[Any, Optional[Tuple[Dict[str, float], float]]]:
-    """
-    A wrapper to unpack arguments for a worker function, allowing it to be used
-    with multiprocessing.Pool.imap_unordered.
-
-    Args:
-        args_tuple: A tuple where the first element is an identifier (e.g., op_type, node_name)
-                    and the rest are the arguments for _worker_quant_and_benchmark.
-    
-    Returns:
-        A tuple containing the identifier and the result from the worker function.
-    """
     identifier, worker_args = args_tuple[0], args_tuple[1:]
     result = _worker_quant_and_benchmark(*worker_args)
     return identifier, result
@@ -396,57 +388,85 @@ def _worker_quant_and_benchmark(
     run_benchmark_args: Dict[str, Any]
 ) -> Optional[Tuple[Dict[str, float], float]]:
     """
-    A top-level function for multiprocessing workers that is robust and process-safe.
-    It creates a fully isolated, ephemeral directory for each task, containing its own
-    copy of the source model to prevent race conditions during quantization.
+    Improved version with robust cleanup and more Pythonic file operations.
     """
     pid = os.getpid()
     task_id = f"worker_{pid}_{uuid.uuid4().hex[:8]}"
     quant_test_dir = run_benchmark_args["quant_test_dir"]
-    
-    # Create a unique, ephemeral directory for the entire task.
     task_temp_dir = quant_test_dir / "workers" / task_id
-    
+
     try:
-        # 1. Create the dedicated directory for this task.
+        # Create a unique, ephemeral directory for the entire task.
         task_temp_dir.mkdir(parents=True, exist_ok=True)
 
-        # 2. Create a private copy of the source model for this task to work on.
-        #    This is CRUCIAL to prevent the shape inference race condition.
+        # Ensure a shared FP32 copy exists on the quant_test_dir volume so we can link from it.
+        shared_dir = quant_test_dir / "shared_fp32"
+        shared_dir.mkdir(parents=True, exist_ok=True)
+        shared_fp32 = shared_dir / model_to_search_path.name
+        lock_path = shared_dir / f"{shared_fp32.name}.lock"
+
+        if not shared_fp32.exists():
+            # Use a file lock to manage access from multiple processes.
+            try:
+                # Attempt to acquire the lock by exclusively creating the lock file.
+                lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    if not shared_fp32.exists():
+                        tmp = shared_dir / f".{shared_fp32.name}.tmp.{uuid.uuid4().hex}"
+                        shutil.copy2(model_to_search_path, tmp)
+                        os.replace(tmp, shared_fp32)
+                finally:
+                    # Always release the lock.
+                    os.close(lock_fd)
+            except FileExistsError:
+                # If the lock file already exists, another process is handling creation. Wait.
+                while not shared_fp32.exists():
+                    time.sleep(0.1)
+            finally:
+                # Clean up
+                if lock_path.exists():
+                    try:
+                        lock_path.unlink()
+                    except OSError:
+                        pass
+
         isolated_model_path = task_temp_dir / model_to_search_path.name
-        shutil.copy(model_to_search_path, isolated_model_path)
 
-        # 3. Define the output path for the quantized model within the same isolated directory.
-        quantized_model_path = task_temp_dir / f"{part_name}-quant.onnx"
+        try:
+            try:
+                os.link(shared_fp32, isolated_model_path)
+            except OSError:
+                logging.warning(f"Could not create hard link for {model_to_search_path.name}. Falling back to a full copy.")
+                # Fallback to full copy if cross-volume link (Windows)
+                shutil.copy2(shared_fp32, isolated_model_path)
 
-        # 4. Quantize using the ISOLATED source model. All temporary files (e.g., `-inferred.onnx`)
-        #    will now be safely created and deleted within this task's private directory.
-        dynamic_quantization(
-            model_to_search_path=isolated_model_path,
-            out_path=quantized_model_path,
-            quant_type=quant_type,
-            nodes_to_exclude=exclusion_list,
-            extra_options=quant_extra_options
-        )
+            quantized_model_path = task_temp_dir / f"{part_name}-quant.onnx"
+            dynamic_quantization(
+                model_to_search_path=isolated_model_path,
+                out_path=quantized_model_path,
+                quant_type=quant_type,
+                nodes_to_exclude=exclusion_list,
+                extra_options=quant_extra_options
+            )
 
-        # 5. Determine model paths for the benchmark run.
+        finally:
+            if isolated_model_path.exists():
+                isolated_model_path.unlink()
+
+        # Select the appropriate encoder/decoder paths for benchmarking
         encoder_path = quantized_model_path if part_name == "encoder" else fixed_encoder_path
         decoder_path = quantized_model_path if part_name == "decoder" else fixed_decoder_path
 
         result = run_benchmark(encoder_path, decoder_path, **run_benchmark_args)
         return result
-        
+
     except Exception as e:
         logging.error(f"Task {task_id} failed for exclusion list size {len(exclusion_list)}: {e}", exc_info=True)
         return None
+
     finally:
-        # 6. Atomically clean up the entire temporary directory for the task.
-        #    This removes the copied source model and the quantized output, leaving no trace.
-        try:
-            if 'task_temp_dir' in locals() and task_temp_dir.exists():
-                shutil.rmtree(task_temp_dir)
-        except Exception as e_cleanup:
-            logging.warning(f"Task {task_id}: Failed to clean up directory {task_temp_dir}: {e_cleanup}")
+        if task_temp_dir.exists():
+            shutil.rmtree(task_temp_dir)
 
 def _initialize_search_state(
     state_path: Path,
@@ -545,7 +565,7 @@ def _run_stage1_search(
 
     # --- Strategy: 'best' with multiprocessing ---
     if multiprocessing_enabled and strategy == 'best':
-        workers = cfg.get("workers") or os.cpu_count()
+        workers = cfg.get("workers") or max(1, os.cpu_count() // 2)
         logging.info(f"🚀 Multiprocessing enabled for Stage 1 ('best' strategy) search with {workers} workers.")
 
         tasks_with_op_types, ops_to_process = [], []
@@ -695,7 +715,7 @@ def _run_stage2_pruning(
 
     multiprocessing_enabled = cfg.get("multiprocessing", False)
     if multiprocessing_enabled:
-        workers = cfg.get("workers") or os.cpu_count()
+        workers = cfg.get("workers") or max(1, os.cpu_count() // 2)
         logging.info(f"🚀 Multiprocessing enabled for Stage 2 search with {workers} workers.")
 
     initial_node_count = len(stage2_candidate_nodes)
@@ -767,6 +787,16 @@ def _run_stage2_pruning(
                     nodes_left_for_pass = []
                     if resume_enabled: persist_state(stage=2, best_list=best_exclusion_list, best_score=current_best_score, nodes_left_for_stage2=nodes_left_for_pass)
 
+            # Cleanup is performed here, after the pool is closed, to avoid race conditions.
+            quant_test_dir = worker_args["run_benchmark_args"]["quant_test_dir"]
+            worker_dir = quant_test_dir / "workers"
+            if worker_dir.exists():
+                try:
+                    shutil.rmtree(worker_dir)
+                    logging.info(f"🧹 Cleaned up worker directory after pass #{pass_num}.")
+                except Exception as e:
+                    logging.warning(f"Could not clean up worker directory after pass #{pass_num}: {e}")
+
         # Sequential path (multiprocessing=False)
         else:
             num_initial_candidates = len(stage2_candidate_nodes)
@@ -820,6 +850,7 @@ def find_optimal_exclusions(
     part_name: str,
     fixed_encoder_path: Path,
     fixed_decoder_path: Path,
+    stage2_fixed_path: Path,
     baseline_score: float,
     reference_score: float,
     run_benchmark_args: Dict[str, Any],
@@ -906,6 +937,13 @@ def find_optimal_exclusions(
     except Exception as e:
         logging.warning(f"Stage 1 cleanup failed: {e}")
 
+    if stage2_fixed_path:
+        logging.info(f"Switching to realistic partner model for Stage 2: {stage2_fixed_path.name}")
+        if part_name == "decoder":
+            worker_args["fixed_encoder_path"] = stage2_fixed_path
+        else: # part_name == "encoder"
+            worker_args["fixed_decoder_path"] = stage2_fixed_path
+
     # 5. Run Stage 2: Pruning
     final_exclusion_list, final_score = _run_stage2_pruning(
         state, cfg, part_name, minimize_metric, primary_metric,
@@ -931,7 +969,7 @@ def apply_quantization_from_exclusions_file(
     cfg: dict
 ):
     """
-    Skips the search, reads exclusions from a file, and quantizes the models to UINT8.
+    Skips the search, reads exclusions from a file, and quantizes the models.
     """
     logging.info(f"Applying exclusions from: {exclusions_file}")
     logging.info("Search will be skipped.")
