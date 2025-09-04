@@ -134,3 +134,17 @@ def _cleanup_stage1_temp_dirs(quant_test_dir: Path) -> None:
                 logging.info(f"Removed Stage 1 temp dir: {item}")
         except Exception as e:
             logging.warning(f"Failed to remove temp directory {item}: {e}")
+
+
+def _cleanup_stage2_temp_dirs(quant_test_dir: Path) -> None:
+    """
+    Remove leftover temporary directories created during Stage 2.
+    """
+    # Clean up the worker directory now that Stage 2 is complete.
+    worker_dir = quant_test_dir / "workers"
+    if worker_dir.exists():
+        try:
+            shutil.rmtree(worker_dir)
+            logging.info("🧹 Cleaned up Stage 2 worker directory.")
+        except Exception as e:
+            logging.warning(f"Could not clean up Stage 2 worker directory: {e}")
