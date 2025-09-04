@@ -265,13 +265,13 @@ if __name__ == "__main__":
         logging.info("🔬 Establishing baseline for encoder search (quantized encoder + FP32 decoder)...")
         encoder_search_baseline_metrics, _ = run_benchmark(baseline_quant_encoder_path, fp32_decoder_path, **run_benchmark_args)
         encoder_search_baseline_score = encoder_search_baseline_metrics[PRIMARY_METRIC]
-        logging.info(f"✅ Encoder Search Baseline {PRIMARY_METRIC.upper()}: {encoder_search_baseline_score:.4f}")
+        logging.info(f"✅ Encoder Full quantized Baseline {PRIMARY_METRIC.upper()}: {encoder_search_baseline_score:.4f}")
 
         # Check if the baseline already meets the reference performance
         fp32_level_met = (encoder_search_baseline_score <= REFERENCE_SCORE) if minimize_metric else (encoder_search_baseline_score >= REFERENCE_SCORE)
 
         if fp32_level_met:
-            logging.info(f"✅ Encoder search baseline ({encoder_search_baseline_score:.4f}) already meets/exceeds the FP32 reference ({REFERENCE_SCORE:.4f}).")
+            logging.info(f"✅ Encoder Full quantized baseline ({encoder_search_baseline_score:.4f}) already meets/exceeds the FP32 reference ({REFERENCE_SCORE:.4f}).")
             logging.info("Skipping node exclusion search for the encoder as it's not needed.")
             encoder_exclusion_list = []
         else:
@@ -289,7 +289,8 @@ if __name__ == "__main__":
                     nodes_by_type=encoder_nodes_by_type,
                     part_name="encoder",
                     fixed_encoder_path=None,  # Not used when searching encoder
-                    fixed_decoder_path=fp32_decoder_path,  # Use FP32 decoder to isolate encoder issues
+                    fixed_decoder_path=fp32_decoder_path,  # Use FP32 decoder for stage 1
+                    stage2_fixed_path=fp32_decoder_path,  # Use FP32 decoder for stage 2
                     baseline_score=encoder_search_baseline_score,
                     **search_args
                 )
@@ -300,13 +301,13 @@ if __name__ == "__main__":
         logging.info("🔬 Establishing baseline for decoder search (FP32 encoder + quantized decoder)...")
         decoder_search_baseline_metrics, _ = run_benchmark(fp32_encoder_path, baseline_quant_decoder_path, **run_benchmark_args)
         decoder_search_baseline_score = decoder_search_baseline_metrics[PRIMARY_METRIC]
-        logging.info(f"✅ Decoder Search Baseline {PRIMARY_METRIC.upper()}: {decoder_search_baseline_score:.4f}")
+        logging.info(f"✅ Decoder Full quantized Baseline {PRIMARY_METRIC.upper()}: {decoder_search_baseline_score:.4f}")
 
         # Check if the baseline already meets the reference performance
         fp32_level_met = (decoder_search_baseline_score <= REFERENCE_SCORE) if minimize_metric else (decoder_search_baseline_score >= REFERENCE_SCORE)
 
         if fp32_level_met:
-            logging.info(f"✅ Decoder search baseline ({decoder_search_baseline_score:.4f}) already meets/exceeds the FP32 reference ({REFERENCE_SCORE:.4f}).")
+            logging.info(f"✅ Decoder Full quantized baseline ({decoder_search_baseline_score:.4f}) already meets/exceeds the FP32 reference ({REFERENCE_SCORE:.4f}).")
             logging.info("Skipping node exclusion search for the decoder as it's not needed.")
             decoder_exclusion_list = []
         else:
@@ -323,36 +324,12 @@ if __name__ == "__main__":
                     model_to_search_path=fp32_decoder_path,
                     nodes_by_type=decoder_nodes_by_type,
                     part_name="decoder",
-                    fixed_encoder_path=fp32_encoder_path,  # Use FP32 encoder to isolate decoder issues
                     fixed_decoder_path=None,  # Not used when searching decoder
+                    fixed_encoder_path=fp32_encoder_path,  # Use FP32 encoder for stage 1
+                    stage2_fixed_path=fp32_encoder_path,  # Use FP32 encoder for stage 2
                     baseline_score=decoder_search_baseline_score,
                     **search_args
                 )
-
-    if SEARCH_TARGET == "both" and encoder_exclusion_list and decoder_exclusion_list:
-        logging.info("\n>>>--- COMPARING ENCODER-ONLY VS DECODER-ONLY OPTIMIZATION ---<<<")
-        logging.info(f"Encoder-only optimization score ({PRIMARY_METRIC.upper()}): {encoder_final_score:.4f}")
-        logging.info(f"Decoder-only optimization score ({PRIMARY_METRIC.upper()}): {decoder_final_score:.4f}")
-
-        # Decide which exclusion list to keep based on which one gave a better result
-        # in its isolated test.
-        if minimize_metric:
-            # Lower is better
-            if decoder_final_score < encoder_final_score:
-                logging.info("Decoder-only optimization is better. Discarding encoder exclusions.")
-                encoder_exclusion_list = []
-            else:
-                logging.info("Encoder-only optimization is better or equal. Discarding decoder exclusions.")
-                decoder_exclusion_list = []
-        else:
-            # Higher is better
-            if decoder_final_score > encoder_final_score:
-                logging.info("Decoder-only optimization is better. Discarding encoder exclusions.")
-                encoder_exclusion_list = []
-            else:
-                logging.info("Encoder-only optimization is better or equal. Discarding decoder exclusions.")
-                decoder_exclusion_list = []
-
 
     # --- Run a final benchmark with the optimal exclusion lists ---
     logging.info("\n🔬 Benchmarking final configuration with optimal exclusions...")
