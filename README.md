@@ -27,6 +27,7 @@ Supports multiprocessing to speed up the process.
 ### Prerequisites
 
 *   Python 3.8+
+*   CUDA >=12.6
 *   ONNX Runtime
 *   Transformers
 *   Optimum
