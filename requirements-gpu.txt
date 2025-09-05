@@ -7,4 +7,7 @@ jiwer==4.0.0
 safetensors==0.6.2
 sentencepiece==0.2.1
 optimum[onnxruntime]==1.27.0
-torch==2.8.0
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
